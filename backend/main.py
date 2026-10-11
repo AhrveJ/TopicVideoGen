@@ -51,7 +51,6 @@ def health():
     import os, shutil
     return {
         "ffmpeg": bool(shutil.which("ffmpeg")),
-        "gemini_script": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "claude_script": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
         "script_generation": True,
         "pexels_footage": bool(os.getenv("PEXELS_API_KEY")),

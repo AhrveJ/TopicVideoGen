@@ -3,7 +3,7 @@
 Stage 1: topic -> title + scenes + source metadata.
 
 Features:
-- Gemini- or Claude-generated narration
+- Claude-generated narration
 - JSON and word-count validation
 - One automatic correction attempt
 - Wikipedia article text and thumbnail retrieval
@@ -333,100 +333,6 @@ def _llm_from_source(
     return _generate_with_context(topic, n, source_text)
 
 
-def _generate_with_gemini(
-    topic: str,
-    n: int,
-    source_text: str | None = None,
-) -> dict:
-    """Generate and validate a script with Gemini; retry once on bad JSON."""
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-
-    system_prompt = SYSTEM
-    if source_text:
-        system_prompt += """
-
-ADDITIONAL SOURCE REQUIREMENT
-
-Use the supplied reference material as the factual foundation.
-Do not add unsupported facts, dates, names, or statistics.
-"""
-
-    user_content = (
-        f"User's topic: {topic}\n"
-        f"Required number of scenes: {n}\n"
-    )
-    if source_text:
-        user_content += (
-            "\nReference material:\n"
-            f"{source_text[:18000]}\n\n"
-            "Build a connected narrative using the reference material."
-        )
-    else:
-        user_content += (
-            "\nCreate a topic-specific, coherent narrative. "
-            "Use factual details only when you are confident they are accurate."
-        )
-
-    contents = [{"role": "user", "parts": [{"text": user_content}]}]
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-
-    for attempt in range(2):
-        response = httpx.post(
-            endpoint,
-            headers={"x-goog-api-key": api_key},
-            json={
-                "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": contents,
-                "generationConfig": {
-                    "maxOutputTokens": 3500,
-                    "responseMimeType": "application/json",
-                },
-            },
-            timeout=90,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        candidates = payload.get("candidates") or []
-        output = "".join(
-            part.get("text", "")
-            for part in candidates[0].get("content", {}).get("parts", [])
-            if isinstance(part.get("text"), str)
-        ).strip() if candidates else ""
-
-        if not output:
-            block_reason = (
-                (payload.get("promptFeedback") or {}).get("blockReason")
-                or (candidates[0].get("finishReason") if candidates else None)
-                or "no text returned"
-            )
-            raise RuntimeError(f"Gemini returned no script text ({block_reason}).")
-
-        try:
-            return _parse_and_validate(output, n)
-        except (json.JSONDecodeError, ValueError) as exc:
-            if attempt == 1:
-                raise ValueError(f"Gemini output failed validation: {exc}") from exc
-            contents.extend([
-                {"role": "model", "parts": [{"text": output}]},
-                {
-                    "role": "user",
-                    "parts": [{
-                        "text": (
-                            f"Your previous output failed validation: {exc}\n"
-                            "Rewrite the entire JSON response. Return exactly "
-                            f"{n} scenes, each with 22–30 narration words and "
-                            "2–4 keyword words. Return JSON only."
-                        )
-                    }],
-                },
-            ])
-
-    raise RuntimeError("Gemini generation failed.")
-
-
 # ---------------------------------------------------------
 # WIKIPEDIA LOOKUP
 # ---------------------------------------------------------
@@ -735,24 +641,17 @@ def write_script(
     article_url = None
     article_text = None
     script_failures = []
-    providers = []
-    if os.getenv("GEMINI_API_KEY", "").strip():
-        providers.append(("gemini", _generate_with_gemini))
-    if os.getenv("ANTHROPIC_API_KEY", "").strip():
-        providers.append(("claude", _generate_with_context))
+    claude_configured = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
 
-    # Prefer a configured generative model, but keep generation available
-    # through source-based or clearly generic narration when none is usable.
-    for provider_name, generate in providers:
+    # Keep generation available through source-based or generic narration
+    # when Claude is not configured or its request fails.
+    if claude_configured:
         try:
-            data = generate(topic, n_scenes)
-            source = provider_name
-            break
+            data = _generate_with_context(topic, n_scenes)
+            source = "claude"
         except Exception as exc:
-            print(f"[script] {provider_name.title()} generation failed: {exc}")
-            script_failures.append(
-                f"{provider_name.title()} request failed ({type(exc).__name__})"
-            )
+            print(f"[script] Claude generation failed: {exc}")
+            script_failures.append(f"Claude request failed ({type(exc).__name__})")
 
     try:
         wiki = _wikipedia(topic)
@@ -765,19 +664,16 @@ def write_script(
         print("[script] Wikipedia image:", image_url or "No thumbnail available")
 
     if data is None and article_text:
-        for provider_name, generate in providers:
+        if claude_configured:
             try:
-                data = generate(topic, n_scenes, article_text)
-                source = f"wikipedia+{provider_name}"
-                break
+                data = _generate_with_context(topic, n_scenes, article_text)
+                source = "wikipedia+claude"
             except Exception as exc:
                 print(
-                    f"[script] Source-grounded {provider_name.title()} "
-                    f"generation failed: {exc}"
+                    f"[script] Source-grounded Claude generation failed: {exc}"
                 )
                 script_failures.append(
-                    f"Source-grounded {provider_name.title()} request failed "
-                    f"({type(exc).__name__})"
+                    f"Source-grounded Claude request failed ({type(exc).__name__})"
                 )
 
     if data is None:
